@@ -1,0 +1,43 @@
+spring.profiles.active=${ACTIVE_PROFILE}
+
+logging.level.root=${LOG_LEVEL}
+
+jwt.secret.key=${JWT_SECRET_KEY}
+
+#mongoDB
+spring.data.mongodb.uri=mongodb://${DB_USERNAME}:${DB_PASSWORD}@${MONGO_DB_HOST}:${MONGO_DB_PORT}/${MONGO_DB_DATABASE}
+#?authSource=${MONGO_AUTH_SOURCE}
+spring.data.mongodb.auto-index-creation=true
+
+#Message Broker
+com.scaffold.broker-host-name=${BROKER_HOST}
+com.scaffold.broker-port= ${BROKER_PORT}
+com.scaffold.broker-username= ${BROKER_USERNAME}
+com.scaffold.broker-password=${BROKER_PASSWORD}
+
+#AWS s3
+cloud.aws.bucket.name=${AWS_BUCKET_NAME}
+cloud.aws.region.static=${AWS_BUCKET_REGION}
+cloud.aws.credentials.access-key=${AWS_ACCESS_KEY_ID}
+cloud.aws.credentials.secret-key=${AWS_SECRET_ACCESS_KEY}
+
+
+#Email properties
+spring.mail.host=${MAIL_HOST}
+spring.mail.port=${MAIL_PORT}
+spring.mail.username=${MAIL_USERNAME}
+spring.mail.password=${MAIL_PASSWORD}
+spring.mail.properties.mail.smtp.auth=true
+spring.mail.properties.mail.smtp.starttls.enable=true
+
+#Email overriding.
+com.scaffold.mail.override=${MAIL_OVERRIDE}
+
+com.scaffold.meeting.url.prefix=${ANONYMOUS_MEETING_URL_PRIFIX}
+
+favorite_chatroom_size=${FAVORITE_CHATROOM_SIZE}
+
+#uploading file size
+spring.servlet.multipart.max-file-size=1500MB
+spring.servlet.multipart.max-request-size=1500MB
+

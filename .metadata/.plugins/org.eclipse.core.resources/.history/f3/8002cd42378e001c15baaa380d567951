@@ -1,0 +1,496 @@
+package com.scaffold.service.impl;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.scaffold.dto.RoomDataFilterDTO;
+import com.scaffold.dto.UserDataTransfer;
+import com.scaffold.dto.chat.AdminRoomResponse;
+import com.scaffold.dto.meeting.MeetingFilterDTO;
+import com.scaffold.exception.InvalidDataTimeRangeException;
+import com.scaffold.exception.UserNotFoundException;
+import com.scaffold.model.User;
+import com.scaffold.model.UserFeedback;
+import com.scaffold.model.VideoLinks;
+import com.scaffold.model.chat.ChatRoom;
+import com.scaffold.model.chat.Member;
+import com.scaffold.model.chat.Message;
+import com.scaffold.model.chat.MessageStore;
+import com.scaffold.model.meeting.Meeting;
+import com.scaffold.model.meeting.MeetingMessageStore;
+import com.scaffold.repository.AnonymousUserRepository;
+import com.scaffold.repository.ChatRoomRepository;
+import com.scaffold.repository.MeetingMessageStoreRepository;
+import com.scaffold.repository.MeetingRepository;
+import com.scaffold.repository.MessageStoreRepository;
+import com.scaffold.repository.UserFeedbackRepository;
+import com.scaffold.repository.UserRepository;
+import com.scaffold.service.AdminService;
+import com.scaffold.service.CommonMethodService;
+import com.scaffold.transcribe.VideoLinkRepository;
+import com.scaffold.web.StringConstants;
+import com.scaffold.web.util.MessageEnum;
+import com.scaffold.web.util.UserRoles;
+import com.scaffold.ws.event.MessageEventHandler;
+
+@Service
+public class AdminServiceImpl implements AdminService {
+
+	@Autowired MongoTemplate mongoTemplate;
+	@Autowired ObjectMapper objectMapper;							
+	@Autowired UserRepository userRepository;
+	@Autowired UserFeedbackRepository feedbackRepository;
+	@Autowired ChatRoomRepository chatRoomRepository;
+	@Autowired MessageStoreRepository messageStoreRepository;
+	@Autowired MessageEventHandler messageEventHandler;
+	@Autowired public CommonMethodService commonMethodService;
+	@Autowired MeetingRepository meetingRepository;
+	@Autowired MeetingMessageStoreRepository meetingMessageStoreRepository;
+	@Autowired AnonymousUserRepository anonymousUserRepository;
+	@Autowired VideoLinkRepository videoLinkRepository;
+	@Autowired ObjectMapper mapper;
+	
+	@Value("${com.scaffold.meeting.url.prefix}")
+	private String meetingUrlPrefix;
+
+	private static final Logger log = LoggerFactory.getLogger(AdminServiceImpl.class);
+
+	public long generateUserId(long currentTimeMillis) {
+	    Random randomNumber = new Random(currentTimeMillis);
+	    return ((1 + randomNumber.nextInt(2)) * 1000 + randomNumber.nextInt(1000));
+	}
+
+	@Override
+	public List<AdminRoomResponse> getAllChatRooms(RoomDataFilterDTO data) {
+		List<ChatRoom> listOfChatRooms = new ArrayList<>();
+		if (Objects.nonNull(data.getUserId()) && !data.getUserId().isEmpty()) {
+			data.getUserId().parallelStream().forEach(user->{
+				if(!userRepository.findByUserId(user).isPresent()) {
+					throw new UserNotFoundException("user not found with id : " + user);
+				}
+				listOfChatRooms.addAll(handleChatRooms(data, user));
+			});
+		}else {
+			listOfChatRooms.addAll(handleChatRooms(data, 0L));
+		}
+		return getAllChatRoomResponse(listOfChatRooms, data.getFilterType());
+	}
+
+	private List<ChatRoom> handleChatRooms(RoomDataFilterDTO data, long userId) {
+		if (Objects.nonNull(data.getFromDate()) && Objects.nonNull(data.getToDate())) {
+			if(data.getFromDate().isAfter(data.getToDate())) {
+				throw new InvalidDataTimeRangeException("Invalid date range");
+			}
+			return filterChatRoomsBetweenDates(data, userId);
+		} else if(Objects.isNull(data.getFromDate()) && Objects.isNull(data.getToDate())) {
+			return filterChatRoomsByUser(data, userId);
+		}
+		return Collections.emptyList();
+	}
+
+	public List<ChatRoom> filterChatRoomsBetweenDates(RoomDataFilterDTO data, long userId) {
+		if (Objects.isNull(data.getRoomType()) && (!(userId==0))) {
+			return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)
+					.andOperator(Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate()))).all();
+		}else if(Objects.nonNull(data.getRoomType()) && (!(userId==0))) {
+			if (data.getRoomType().equals(MessageEnum.GROUP.getValue())) {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)
+						.andOperator(Criteria.where(StringConstants.CHAT_ROOM_TYPE).ne(MessageEnum.PERSONAL.getValue()),
+						Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate()))).all();
+			}else {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)
+						.andOperator(Criteria.where(StringConstants.CHAT_ROOM_TYPE).is(data.getRoomType()),
+						Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate()))).all();
+			}
+		}else if(userId==0 && Objects.nonNull(data.getRoomType())){
+			if (data.getRoomType().equals(MessageEnum.GROUP.getValue())) {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.CHAT_ROOM_TYPE).ne(MessageEnum.PERSONAL.getValue())).all();
+			}else {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.CHAT_ROOM_TYPE).is(data.getRoomType())
+						.andOperator(Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate()))).all();
+			}
+		}else if(userId==0 && Objects.isNull(data.getRoomType())){
+			return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate())).all();
+		}
+		return Collections.emptyList();
+	}
+	
+	public List<ChatRoom> filterChatRoomsByUser(RoomDataFilterDTO data, long userId) {
+		if (!(userId==0) && Objects.isNull(data.getRoomType())) {
+			return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)).all();
+			
+		}else if(!(userId==0) && Objects.nonNull(data.getRoomType())) {
+			if (data.getRoomType().equals(MessageEnum.GROUP.getValue())) {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)
+						.andOperator(Criteria.where(StringConstants.CHAT_ROOM_TYPE).ne(MessageEnum.PERSONAL.getValue()))).all();
+			}else {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)
+						.andOperator(Criteria.where(StringConstants.CHAT_ROOM_TYPE).is(data.getRoomType()))).all();
+			}
+		}else if(userId==0 && Objects.nonNull(data.getRoomType())){
+			if (data.getRoomType().equals(MessageEnum.GROUP.getValue())) {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.CHAT_ROOM_TYPE).ne(MessageEnum.PERSONAL.getValue())).all();
+			}else {
+				return mongoTemplate.query(ChatRoom.class).matching(Criteria.where(StringConstants.CHAT_ROOM_TYPE).is(data.getRoomType())).all();
+			}
+		}else if(userId==0 && Objects.isNull(data.getRoomType())){
+			return chatRoomRepository.findAll();
+		}
+		return Collections.emptyList();
+	}
+	
+	private List<AdminRoomResponse> getAllChatRoomResponse(List<ChatRoom> listOfChatRooms, String sortBy) {
+		if (!listOfChatRooms.isEmpty()) {
+			List<ChatRoom> newListOfChatRooms = listOfChatRooms.stream().distinct().collect(Collectors.toList());
+			List<AdminRoomResponse> response = newListOfChatRooms.parallelStream().map(chatRoom -> {
+				AdminRoomResponse chatRoomResponse = mapper.convertValue(chatRoom, AdminRoomResponse.class);
+				chatRoomResponse.setTotalMembers(chatRoom.getMembers().size());
+				chatRoomResponse.setMembers(getMembersResponse(chatRoom.getMembers()));
+				chatRoomResponse.setChatRoomName(mapChatRoomNameIfTypePersonal(chatRoom));
+				return chatRoomResponse;
+			}).sorted(arrangeUserChatRoom(sortBy)).collect(Collectors.toList());
+			Collections.reverse(response);
+			return response;
+		}
+		return Collections.emptyList();
+	}
+
+	private Comparator<AdminRoomResponse> arrangeUserChatRoom(String sortBy) {
+		if (sortBy.equals(StringConstants.CREATION_DATE)) {
+			return (c1, c2) -> c1.getCreationDate().compareTo(c2.getCreationDate());
+		} else {
+			return (c1, c2) -> c1.getLastConversation().compareTo(c2.getLastConversation());
+		}
+	}
+	
+	private String mapChatRoomNameIfTypePersonal(ChatRoom chatRoom) {
+		if(chatRoom.getChatRoomType().equals(MessageEnum.PERSONAL.getValue())) {
+			StringBuilder chatRoomName= new StringBuilder();
+			chatRoom.getMembers().forEach(mem -> {
+				User user = userRepository.findByUserId(mem.getUserId().longValue());
+				chatRoomName.append(user.getUsername() + ", ");
+			});
+			return chatRoomName.substring(0, chatRoomName.length()-2);
+		}
+		return chatRoom.getChatRoomName();
+	}
+
+	@Override
+	public boolean deleteChatRoom(String chatRoomId, String roomAccessKey) {
+		return chatRoomRepository.findByChatRoomIdAndIsDeleted(chatRoomId, false).map(room -> {
+			if(room.getRoomAccessKey().equals(roomAccessKey)) {
+				room.setDeleted(true);
+				chatRoomRepository.save(room);
+				return true;
+			}
+			return false;
+		}).orElse(false);
+	}
+
+	@Override
+	public Map<String, Object> getAllMessagesByAdmin(String chatRoomId, String accessKey, int oldSize, int newSize) {
+		MessageStore messageStore = messageStoreRepository.findByChatRoomId(chatRoomId);
+		if (Objects.nonNull(messageStore) && messageStore.getRoomAccessKey().equals(accessKey)) {
+				List<Message> messageDetails = messageStore.getMessageDetails();
+				if (Objects.nonNull(messageDetails) && !messageDetails.isEmpty()) {
+					Map<String, Object> response = new HashMap<>();
+					response.put(StringConstants.TOTAL_SIZE, messageDetails.size());
+					List<Message> limitedMessages = getLimitedMessages(messageDetails, oldSize, newSize);
+					Collections.reverse(limitedMessages);
+					if (!limitedMessages.isEmpty()) {
+						List<Map<String, Object>> messageList = limitedMessages.stream().map(this::mapMessageResponse)
+								.collect(Collectors.toList());
+						response.put(StringConstants.MESSAGES, messageList);
+						return response;
+					}
+					response.put(StringConstants.INVALID, "Invalid newSize or oldSize");
+					return response;
+				}
+				return Collections.emptyMap();
+			}
+		return null;
+	}
+
+	private List<Message> getLimitedMessages(List<Message> messageDetails, int oldSize, int newSize) {
+		int size = messageDetails.size();
+		if (size > oldSize && size > newSize && newSize > oldSize) {
+			return messageDetails.subList(size - newSize, size - oldSize);
+		} else if (size <= newSize && size > oldSize && newSize > oldSize) {
+			return messageDetails.subList(0, size - oldSize);
+		} else if (size <= newSize && size <= oldSize && newSize > oldSize) {
+			return messageDetails.subList(0, size);
+		}
+		return Collections.emptyList();
+	}
+
+	public Map<String, Object> mapMessageResponse(Message message) {
+		HashMap<String, Object> chatMessage = new HashMap<>();
+		chatMessage.put(StringConstants.SENDER, handleSenderDetails(message));
+		chatMessage.put(StringConstants.SENDING_TIME, Timestamp.valueOf(message.getSendingTime()).getTime());
+		chatMessage.put(StringConstants.ID, message.getId());
+		chatMessage.put(StringConstants.IS_DELETED, message.isDeleted());
+		chatMessage.put(StringConstants.IS_EDITED, message.isEdited());
+		chatMessage.put(StringConstants.CONTENT_TYPE, message.getContentType());
+		chatMessage.put(StringConstants.CONTENT, message.getContent());
+		if (Objects.nonNull(message.getEmoji())) {
+			chatMessage.put(StringConstants.EMOJI, message.getEmoji());
+		}
+		return mapAnotherDetailsOfMessage(message, chatMessage);
+	}
+
+	private UserDataTransfer handleSenderDetails(Message message) {
+		UserDataTransfer sender = new UserDataTransfer();
+		if (Objects.isNull(message.getSenderType()) || message.getSenderType().equals("INTERNAL_USER")) {
+			User user = userRepository.findByUserId(message.getSenderId());
+			sender.setUserId(user.getUserId());
+			sender.setUsername(user.getUsername());
+			sender.setImageLink(user.getImage());
+		}else {
+			anonymousUserRepository.findByUserId(message.getSenderId()).ifPresent(userData->{
+				sender.setUserId(userData.getUserId());
+				sender.setUsername(userData.getUsername());
+				sender.setImageLink("NA");
+			});
+		}
+		return sender;
+	}
+
+	private Map<String, Object> mapAnotherDetailsOfMessage(Message message, HashMap<String, Object> chatMessage) {
+		if(message.getContentType().equals(MessageEnum.FILE.getValue())) {
+			chatMessage.put(StringConstants.CONTENT, messageEventHandler.getUrlOfFileToDisplay(message.getContent()));
+			chatMessage.put(StringConstants.FILE_EXTENSION, messageEventHandler.handleFileNameOrExtension(message.getContent(), MessageEnum.EXTENSION.getValue()));
+			chatMessage.put(StringConstants.FILE_NAME, messageEventHandler.handleFileNameOrExtension(message.getContent(), ""));
+			chatMessage.put(StringConstants.FILE_EXTENSION, messageEventHandler.getFileExtension(message.getContent()));
+		}else if(message.getContentType().equals(MessageEnum.FORWARD_MESSAGE.getValue())) {
+			chatMessage.put(StringConstants.FORWARD_MESSAGE_DETAILS, message.getForwardMessageDetails());
+		} else if(message.getContentType().equals(MessageEnum.QUOTE_MESSAGE.getValue())) {
+			chatMessage.put(StringConstants.QUOTE_MESSAGE_DETAILS, message.getQuoteMessageDetails());
+		} 
+		return chatMessage;
+	}
+
+	private List<Map<String, Object>> getMembersResponse(List<Member> members) {
+		if (!members.isEmpty()) {
+			return members.stream().map(mem -> {
+				User user = userRepository.findByUserId(mem.getUserId().longValue());
+				HashMap<String, Object> userDetail = new HashMap<>();
+				userDetail.put(StringConstants.USER_ID, mem.getUserId());
+				userDetail.put(StringConstants.IMAGE_LINK, user.getImage());
+				userDetail.put(StringConstants.USERNAME, user.getUsername());
+				userDetail.put(StringConstants.IS_CREATOR, mem.isCreator());
+				userDetail.put(StringConstants.IS_ONLINE, user.isOnline());
+				return userDetail;
+			}).collect(Collectors.toList());
+		}
+		return Collections.emptyList();
+	}
+
+	@Override
+	public Object updateUserRoles(Long userId, String userRole, boolean actionType) {
+		Optional<User> userStream = userRepository.findByUserId(userId);
+		if (userStream.isPresent()) {
+			User user = userStream.get();
+			if (actionType) {
+				return addUserRole(user, userRole);
+			}else if (!actionType) {
+				return removeUserRole(user, userRole);
+			}
+		}
+		return null;
+	}
+
+	private Object addUserRole(User user, String userRole) {
+		List<String> roles = user.getRoles();
+		if (Stream.of(UserRoles.values()).anyMatch(role -> role.name().equalsIgnoreCase(userRole)) 
+				&& !roles.contains(userRole.toUpperCase())) {
+			roles.add(userRole.toUpperCase());
+			user.setRoles(roles);
+			return userRepository.save(user).getRoles();
+		}
+		return "Invalid Role or Role already exits.";
+	}
+	
+	private Object removeUserRole(User user, String userRole) {
+		List<String> roles = user.getRoles();
+		if (roles.removeIf(role->role.contains(userRole))) {
+			user.setRoles(roles);
+			return userRepository.save(user).getRoles();
+		}
+		return "Role not contains or Invalid Role.";
+	}
+	
+	@Override
+	public List<Object> getAllMeetings(MeetingFilterDTO data) {
+		List<Meeting> listOfMeeting = new ArrayList<>();
+		if(Objects.nonNull(data.getUserId()) && !data.getUserId().isEmpty()) {
+			data.getUserId().forEach(user->{
+				List<Meeting> listOfUserMeetings=handleMeetings(data, user);
+				Collections.reverse(listOfUserMeetings);
+				listOfMeeting.addAll(listOfUserMeetings);
+			});
+		}else {
+			List<Meeting> meetings=handleMeetings(data, 0L);
+			Collections.reverse(meetings);
+			listOfMeeting.addAll(meetings);
+		}
+		return getAllMeetingResponse(listOfMeeting);
+	}
+	
+	private List<Object> getAllMeetingResponse(List<Meeting> listOfMeetings){
+		List<Object> response=new ArrayList<>();
+		if (!listOfMeetings.isEmpty()) {
+			 List<Meeting> newListOfMeeting= listOfMeetings.stream()
+					 .sorted(Comparator.comparing(Meeting::getMeetingStartDateTime).reversed()).distinct().collect(Collectors.toList());
+			 newListOfMeeting.forEach(meeting -> {
+				@SuppressWarnings("unchecked")
+				Map<String, Object> meetingDetails = mapper.convertValue(meeting, HashMap.class);
+				meetingDetails.remove("meetingMessageStore");
+				meetingDetails.put("recordingData", getRecordingData(meeting));
+				meetingDetails.put("meetingLink", meetingUrlPrefix+meeting.getMeetingId());
+				response.add(meetingDetails);
+			});
+			return response;
+		}
+		return Collections.emptyList();
+	}
+	
+	private List<Meeting> handleMeetings(MeetingFilterDTO data, long userId) {
+		if (Objects.nonNull(data.getFromDate()) && Objects.nonNull(data.getToDate()) 
+				&& Objects.nonNull(data.getFilterType())) {
+			return filterMeetingsBetweenDates(data, userId);
+		} else if(Objects.isNull(data.getFromDate()) && Objects.isNull(data.getToDate())) {
+			return filterMeetingsByUser(data, userId);
+		}
+		return Collections.emptyList();
+	}
+	
+	public List<Meeting> filterMeetingsBetweenDates(MeetingFilterDTO data, long userId) {
+		if (userId>0) {
+			return mongoTemplate.query(Meeting.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)
+					.andOperator(Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate()))).all();
+		}else if(userId<=0){
+			return mongoTemplate.query(Meeting.class).matching(Criteria.where(data.getFilterType()).gte(data.getFromDate()).lte(data.getToDate())).all();
+		}
+		return Collections.emptyList();
+	}
+	
+	public List<Meeting> filterMeetingsByUser(MeetingFilterDTO data, long userId) {
+		if (userId>0) {
+			return mongoTemplate.query(Meeting.class).matching(Criteria.where(StringConstants.MEMBERS_USERID).is(userId)).all();
+		}else if(userId<=0 && Objects.isNull(data.getFromDate()) && Objects.isNull(data.getToDate())){
+			return meetingRepository.findAll();
+		}
+		return Collections.emptyList();
+	}
+
+	private List<Message> getRecordingData(Meeting meeting) {
+		MeetingMessageStore meetingMessageStore = meeting.getMeetingMessageStore();
+		if (Objects.nonNull(meetingMessageStore)) {
+			return meetingMessageStore.getMessageDetails().stream().filter(message->message.getContentType()
+					.equals("RECORDING_MESSAGE")).collect(Collectors.toList());
+		}
+		return Collections.emptyList();
+	}
+
+	@Override
+	public Map<String, Object> getAllMeetingMessage(String meetingId, String accessKey, int oldSize, int newSize) {
+		Optional<MeetingMessageStore> messageStoreStream = meetingMessageStoreRepository.findByMeetingId(meetingId);
+		if (messageStoreStream.isPresent()) {
+			MeetingMessageStore messageStore = messageStoreStream.get();
+			List<Message> messageDetails = messageStore.getMessageDetails();
+			if (messageStore.getRoomAccessKey().equals(accessKey) && Objects.nonNull(messageDetails)&& !messageDetails.isEmpty()) {
+				Map<String, Object> response = new HashMap<>();
+				response.put(StringConstants.TOTAL_SIZE, messageDetails.size());
+				List<Message> limitedMessages = getLimitedMessages(messageDetails, oldSize, newSize);
+				Collections.reverse(limitedMessages);
+				if (!limitedMessages.isEmpty()) {
+					List<Map<String, Object>> messageList = limitedMessages.stream().map(this::mapMessageResponse)
+							.collect(Collectors.toList());
+					response.put(StringConstants.MESSAGES, messageList);
+					return response;
+				}
+				response.put(StringConstants.INVALID, "Invalid newSize or oldSize");
+				return response;
+			}
+			return Collections.emptyMap();
+		}
+		return null;
+	}
+
+	@Override
+	public List<Map<String, Object>> getAllUserFeedback(LocalDateTime fromDateTime, LocalDateTime toDateTime) {
+		if (Objects.nonNull(fromDateTime) && Objects.nonNull(toDateTime) && toDateTime.isAfter(fromDateTime)) {
+			List<UserFeedback> feedback = mongoTemplate.query(UserFeedback.class).matching(Criteria.where("sendingTime").gte(fromDateTime)
+					.andOperator(Criteria.where("sendingTime").lte(toDateTime))).all();
+			return mapFeedbackDetails(feedback);
+		}else if(Objects.isNull(fromDateTime) && Objects.isNull(toDateTime)) {
+			return mapFeedbackDetails(feedbackRepository.findAll());
+		}
+		return null;
+	}
+	
+	private List<Map<String, Object>> mapFeedbackDetails(List<UserFeedback> feedback) {
+		List<Map<String, Object>> listOfFeedback = new ArrayList<>();
+		if (!feedback.isEmpty() && Objects.nonNull(listOfFeedback)) {
+			UserFeedback feed = new UserFeedback();
+			feed.getSendingTime();
+			feedback.parallelStream().sorted(Comparator.comparing(UserFeedback::getSendingTime).reversed()).forEachOrdered(feedbackData->{
+			     Map<String,Object> response = new HashMap<>();
+			     response.put(StringConstants.USER, handleSenderDetails(new Message(feedbackData.getUserId(), feedbackData.getUserType())));
+			     //response.put(StringConstants.USER_TYPE, feedbackData.getUserType());
+			     response.put(StringConstants.RATEING, feedbackData.getRating());
+			     response.put(StringConstants.CONTENT, feedbackData.getContent());
+			     response.put(StringConstants.FEEDBACK_TYPE, Objects.nonNull(feedbackData.getFeedbackType()) ? feedbackData.getFeedbackType(): "KEBAB_MENU");
+			     response.put(StringConstants.FEEDBACK_TIME, feedbackData.getSendingTime());
+			     response.put(StringConstants.PLATFORM, Objects.nonNull(feedbackData.getPlatform()) ?feedbackData.getPlatform(): "Web" );
+			     listOfFeedback.add(response);
+			});
+			return listOfFeedback;
+		}
+		return Collections.emptyList();
+	}
+
+	@Override
+	public List<Map<String, Object>> getAlltranscribedFileLinks() {
+		List<VideoLinks> videoLinkObj = videoLinkRepository.findByIsAudioTranscribe(true);
+		List<Map<String, Object>> listOfAllvideoLinks = new ArrayList<>();
+		if (Objects.nonNull(videoLinkObj) && !videoLinkObj.isEmpty()) {
+			videoLinkObj.forEach(data -> {
+				Map<String, Object> transcribeLinks = new HashMap<>();
+				transcribeLinks.put(StringConstants.ID, data.getId());
+				transcribeLinks.put(StringConstants.MESSAGE_ID, data.getMessageId());
+				transcribeLinks.put(StringConstants.USER_TYPE, data.getUserType());
+				transcribeLinks.put(StringConstants.VIDEO_LINK, data.getLink());
+				transcribeLinks.put(StringConstants.UPLOADING_DATE_TIME, data.getUploadingDateTime());
+				transcribeLinks.put(StringConstants.IS_AUDIO_TRANSCRIBE, data.isAudioTranscribe());
+				transcribeLinks.put(StringConstants.CHAT_ROOM_TYPE, data.getRoomType());
+				transcribeLinks.put(StringConstants.CHATROOM_ID, data.getRoomId());
+				transcribeLinks.put(StringConstants.USERID, data.getUserId());
+				transcribeLinks.put(StringConstants.TRANSCRIBED_FILE_LINK, data.getTranscribedFileLink());
+				listOfAllvideoLinks.add(transcribeLinks);
+
+			});
+		}
+		return listOfAllvideoLinks;
+	}
+}

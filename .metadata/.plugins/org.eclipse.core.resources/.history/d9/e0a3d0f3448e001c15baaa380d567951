@@ -1,0 +1,46 @@
+package com.scaffold.transcribe;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import com.scaffold.model.VideoLinks;
+import com.scaffold.repository.UserRepository;
+import com.scaffold.service.CommonMethodService;
+import com.scaffold.web.StringConstants;
+
+@Service
+public class TranscribeScheduler {
+
+	@Autowired VideoLinkRepository videoLinkRepository;
+	@Autowired UserRepository userRepository;
+	@Autowired CommonMethodService commonMethodService;
+	@Autowired TranscribeUploadServiceImpl transcribeUploadServiceImpl;
+
+	//@Scheduled(cron = "0 23 * * * *")
+	@Scheduled(fixedDelay = 43200000)
+	@Async
+	public void getTranscribeVideoLinks() {
+		List<VideoLinks> videoLinkObj = videoLinkRepository.findByIsAudioTranscribe(false);
+		ArrayList<String> listOfVideoLink = (ArrayList<String>) videoLinkObj.stream().map(VideoLinks::getLink)
+				.collect(Collectors.toList());
+		for (String link : listOfVideoLink) {
+			String S3RecordingFileName = link.split("amazonaws.com/")[1];
+			String recordedFileTranscriptionURL = transcribeUploadServiceImpl
+					.recordedFileTranscription(S3RecordingFileName);
+			for (VideoLinks links : videoLinkObj) {
+				links.setAudioTranscribe(true);
+				links.setTranscribedFileLink(recordedFileTranscriptionURL);
+				videoLinkRepository.save(links);
+			}
+		}
+	}
+
+}
